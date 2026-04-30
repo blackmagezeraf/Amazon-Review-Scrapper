@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
 Amazon Review Scraper (Browser-based with Playwright)
-Supports manual Amazon login via --login (no time limit – waits forever).
-
-Run `python amazon_reviews_browser.py --help` for full documentation.
+Respects robots.txt by default — use --ignore-robots to bypass.
 """
 
 import argparse
-import datetime
 import logging
 import random
 import re
@@ -29,7 +26,7 @@ ROBOTS_URL = "https://www.amazon.com/robots.txt"
 
 
 # ----------------------------------------------------------------------
-# Robots.txt check (unchanged)
+# Robots.txt check
 # ----------------------------------------------------------------------
 def check_robots(asin, user_agent, ignore, logger):
     rp = RobotFileParser()
@@ -58,78 +55,53 @@ def check_robots(asin, user_agent, ignore, logger):
 
 
 # ----------------------------------------------------------------------
-# Login waiter – INDEFINITE with datetime
+# Robust review extraction
 # ----------------------------------------------------------------------
-def wait_for_manual_login(page, browser, logger):
+def extract_reviews_from_page(page, logger):
     """
-    Navigate to Amazon and wait INDEFINITELY for user to log in.
-    Exits only when login is detected or the browser window is closed.
+    Wait for review cards to appear, handling page navigations gracefully.
+    Returns a list of review dicts, or an empty list if none found.
     """
-    try:
-        page.goto(
-            "https://www.amazon.com", wait_until="domcontentloaded", timeout=15000
-        )
-    except Exception as e:
-        logger.error(f"Could not load Amazon: {e}")
-        sys.exit(1)
-
-    logger.info("🔐  Please log in to your Amazon account in the browser.")
-    logger.info(
-        "⏳  Waiting indefinitely (no time limit). Closing the browser will cancel."
-    )
-
-    start_time = datetime.datetime.now()
-    while True:
-        # 1. If browser or page is closed, exit immediately
-        if page.is_closed() or not browser.is_connected():
-            elapsed = datetime.datetime.now() - start_time
-            logger.error(
-                f"❌  Browser was closed after {str(elapsed).split('.')[0]}. Exiting."
-            )
-            sys.exit(1)
-
-        # 2. Check for login indicators
+    max_retries = 3
+    for attempt in range(max_retries):
         try:
-            greeting_elem = page.query_selector("#nav-link-accountList-nav-line-1")
-            if greeting_elem:
-                greeting = greeting_elem.inner_text()
-                if "Sign in" not in greeting:
-                    logger.info("✅  Login detected (greeting).")
-                    return
+            # Wait for at least one review card (no timeout → wait forever)
+            logger.info("Waiting for reviews to load...")
+            page.wait_for_selector("[data-hook='review']", timeout=0)
+            break  # success, move on
+        except Exception as e:
+            # Could be a navigation error or the page doesn't have reviews
+            logger.warning(f"Attempt {attempt + 1}: {e}")
+            # If the page navigated, wait for it to settle, then retry
+            if "Execution context was destroyed" in str(e) or "Navigation" in str(
+                type(e).__name__
+            ):
+                try:
+                    page.wait_for_load_state("domcontentloaded")
+                    time.sleep(2)
+                except Exception:
+                    pass
+                continue
+            else:
+                # Other error → no reviews
+                return []
 
-            signout = page.query_selector("a#nav-item-signout")
-            if signout:
-                logger.info("✅  Login detected (signout link).")
-                return
-        except Exception:
-            # Page might be navigating, ignore and retry
-            pass
-
-        # 3. Show waiting status every 30 seconds
-        elapsed_seconds = (datetime.datetime.now() - start_time).seconds
-        if elapsed_seconds > 0 and elapsed_seconds % 30 == 0:
-            minutes = elapsed_seconds // 60
-            secs = elapsed_seconds % 60
-            logger.info(f"⏳  Still waiting for login... (elapsed: {minutes}m {secs}s)")
-
-        time.sleep(1)
-
-
-# ----------------------------------------------------------------------
-# Review extraction (unchanged)
-# ----------------------------------------------------------------------
-def extract_reviews_from_page(page):
-    reviews = []
+    # Now collect all cards (the page is stable)
     try:
-        page.wait_for_selector("[data-hook='review']", timeout=10000)
-    except PlaywrightTimeout:
-        pass
+        cards = page.query_selector_all("[data-hook='review']")
+    except Exception:
+        return []
 
-    cards = page.query_selector_all("[data-hook='review']")
+    if not cards:
+        return []
+
+    reviews = []
     for card in cards:
+        # Review text
         body = card.query_selector("[data-hook='review-body']")
         text = body.inner_text().strip() if body else ""
 
+        # Star rating
         stars = ""
         star_icon = card.query_selector("[data-hook='review-star-rating']")
         if star_icon:
@@ -142,6 +114,7 @@ def extract_reviews_from_page(page):
                 match = re.search(r"(\d+\.?\d*)", txt)
                 stars = match.group(1) if match else ""
 
+        # User profile link
         profile = ""
         a_tag = card.query_selector("a.a-profile")
         if a_tag:
@@ -168,6 +141,7 @@ def extract_reviews_from_page(page):
 
 
 def get_next_page_url(page, current_url):
+    """Find the 'Next page' link, return URL or None."""
     next_li = page.query_selector("li.a-last")
     if next_li:
         a = next_li.query_selector("a")
@@ -175,6 +149,7 @@ def get_next_page_url(page, current_url):
             href = a.get_attribute("href")
             if href:
                 return urljoin(current_url, href)
+    # Fallback: look for any link with text "Next page"
     links = page.query_selector_all("a")
     for link in links:
         if "Next page" in (link.inner_text() or ""):
@@ -191,8 +166,9 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=dedent("""\
         🖥️  Amazon Review Scraper (Browser Engine)
-        Uses a real Chromium browser via Playwright to scrape reviews.
-        Supports manual login with --login (no time limit – waits forever).
+        Respects robots.txt by default. Use --ignore-robots to override.
+        Shows a visible Chromium browser (change with --headless).
+        No time limits – waits forever for pages and reviews.
 
         Collects:
           • Review text
@@ -205,16 +181,16 @@ def parse_args():
         ───────────────────────────
         📋 Usage examples:
           %(prog)s B08N5WRWNW
-              Scrape all reviews (headless, no login)
+              Scrape all reviews (visible browser, robots.txt respected)
 
-          %(prog)s B08N5WRWNW --login
-              Open browser, wait indefinitely for login, then scrape
+          %(prog)s B08N5WRWNW --ignore-robots
+              Bypass robots.txt check
 
-          %(prog)s B08N5WRWNW --login --headless 0 -v
-              Visible browser, verbose logging, login first
+          %(prog)s B08N5WRWNW -o reviews.csv --max-pages 5
+              Limit to 5 pages, custom filename
 
-          %(prog)s B08N5WRWNW -o reviews.csv --max-pages 5 --delay-min 0.5 --delay-max 2
-              Custom output, page limit, and jitter
+          %(prog)s B08N5WRWNW --headless 1 --delay-min 0.5 --delay-max 2 -v
+              Run hidden, custom jitter, verbose output
         ───────────────────────────
         """),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -233,28 +209,24 @@ def parse_args():
         "--delay-min",
         type=float,
         default=0.4,
-        help="Min delay between requests, seconds (default: 0.4).",
+        help="Min jitter delay between pages (seconds, default: 0.4).",
     )
     parser.add_argument(
         "--delay-max",
         type=float,
         default=1.5,
-        help="Max delay between requests, seconds (default: 1.5).",
+        help="Max jitter delay between pages (seconds, default: 1.5).",
     )
     parser.add_argument(
         "--headless",
         type=int,
-        default=1,
-        help="Headless mode (1 = yes, 0 = show browser).",
+        choices=[0, 1],
+        default=0,
+        help="Browser visibility (0=visible, 1=headless). Default: 0.",
     )
     parser.add_argument("--user-agent", default=None, help="Custom User-Agent.")
     parser.add_argument(
         "--ignore-robots", action="store_true", help="Bypass robots.txt check."
-    )
-    parser.add_argument(
-        "--login",
-        action="store_true",
-        help="Wait for manual Amazon login (no time limit).",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging.")
     return parser.parse_args()
@@ -299,28 +271,32 @@ def main():
         context = browser.new_context(**context_options)
         page = context.new_page()
 
-        # ── Login step (if requested) – NO TIME LIMIT ──
-        if args.login:
-            wait_for_manual_login(page, browser, logger)
-
         url = BASE_URL_TEMPLATE.format(asin=asin)
 
         while url:
             page_num += 1
-            logger.info(f"Page {page_num}: {url}")
+            logger.info(f"Loading page {page_num}: {url}")
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                # Navigate to page – wait forever if needed
+                page.goto(url, wait_until="domcontentloaded", timeout=0)
+                # Small cooldown to let any redirects or bot challenges settle
+                time.sleep(3)
+                # Random jitter after the page is stable
                 time.sleep(random.uniform(args.delay_min, args.delay_max))
             except Exception as e:
                 logger.error(f"Failed to load page: {e}")
                 break
 
-            content = page.content()
-            if "Enter the characters you see below" in content:
-                logger.warning("CAPTCHA or robot check encountered. Stopping.")
-                break
+            # Check for CAPTCHA
+            try:
+                content = page.content()
+                if "Enter the characters you see below" in content:
+                    logger.warning("CAPTCHA or robot check encountered. Stopping.")
+                    break
+            except Exception:
+                pass
 
-            reviews = extract_reviews_from_page(page)
+            reviews = extract_reviews_from_page(page, logger)
             if not reviews:
                 logger.info("No reviews found. Ending.")
                 break
