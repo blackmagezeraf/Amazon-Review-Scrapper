@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
 Amazon Review Scraper (Browser-based with Playwright)
-Respects robots.txt by default — use --ignore-robots to bypass.
+Respects robots.txt by default. Use --ignore-robots to override.
+Bundled Chromium is found automatically when built as an executable.
 """
 
 import argparse
 import logging
+import os
 import random
 import re
 import sys
@@ -17,6 +19,12 @@ from urllib.robotparser import RobotFileParser
 import pandas as pd
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
+
+# ----------------------------------------------------------------------
+# If running from a PyInstaller bundle, set the browser path
+# ----------------------------------------------------------------------
+if getattr(sys, "frozen", False):
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.path.join(sys._MEIPASS, "browsers")
 
 # ----------------------------------------------------------------------
 # Constants
@@ -55,38 +63,40 @@ def check_robots(asin, user_agent, ignore, logger):
 
 
 # ----------------------------------------------------------------------
-# Robust review extraction
+# Review extraction (polling every 1 second)
 # ----------------------------------------------------------------------
 def extract_reviews_from_page(page, logger):
     """
-    Wait for review cards to appear, handling page navigations gracefully.
-    Returns a list of review dicts, or an empty list if none found.
+    Wait for reviews to appear, handling page navigations gracefully.
+    Returns a list of review dicts, or empty list if none found.
     """
-    max_retries = 3
-    for attempt in range(max_retries):
+    max_attempts = 5
+    for attempt in range(max_attempts):
         try:
-            # Wait for at least one review card (no timeout → wait forever)
-            logger.info("Waiting for reviews to load...")
+            # Wait for at least one review card to appear (no timeout)
+            logger.info(f"Waiting for reviews to load... (attempt {attempt + 1})")
             page.wait_for_selector("[data-hook='review']", timeout=0)
-            break  # success, move on
+            break  # success
+        except PlaywrightTimeout:
+            # timeout not used, but just in case
+            continue
         except Exception as e:
-            # Could be a navigation error or the page doesn't have reviews
-            logger.warning(f"Attempt {attempt + 1}: {e}")
-            # If the page navigated, wait for it to settle, then retry
+            # Could be 'Execution context was destroyed' − page navigated
+            logger.warning(f"Attempt {attempt + 1} failed: {e}")
             if "Execution context was destroyed" in str(e) or "Navigation" in str(
                 type(e).__name__
             ):
                 try:
-                    page.wait_for_load_state("domcontentloaded")
+                    # Wait for the page to fully reload
+                    page.wait_for_load_state("domcontentloaded", timeout=15000)
                     time.sleep(2)
                 except Exception:
                     pass
                 continue
             else:
-                # Other error → no reviews
                 return []
 
-    # Now collect all cards (the page is stable)
+    # Now collect all cards (page is stable)
     try:
         cards = page.query_selector_all("[data-hook='review']")
     except Exception:
@@ -97,11 +107,9 @@ def extract_reviews_from_page(page, logger):
 
     reviews = []
     for card in cards:
-        # Review text
         body = card.query_selector("[data-hook='review-body']")
         text = body.inner_text().strip() if body else ""
 
-        # Star rating
         stars = ""
         star_icon = card.query_selector("[data-hook='review-star-rating']")
         if star_icon:
@@ -114,7 +122,6 @@ def extract_reviews_from_page(page, logger):
                 match = re.search(r"(\d+\.?\d*)", txt)
                 stars = match.group(1) if match else ""
 
-        # User profile link
         profile = ""
         a_tag = card.query_selector("a.a-profile")
         if a_tag:
@@ -141,7 +148,6 @@ def extract_reviews_from_page(page, logger):
 
 
 def get_next_page_url(page, current_url):
-    """Find the 'Next page' link, return URL or None."""
     next_li = page.query_selector("li.a-last")
     if next_li:
         a = next_li.query_selector("a")
@@ -149,7 +155,6 @@ def get_next_page_url(page, current_url):
             href = a.get_attribute("href")
             if href:
                 return urljoin(current_url, href)
-    # Fallback: look for any link with text "Next page"
     links = page.query_selector_all("a")
     for link in links:
         if "Next page" in (link.inner_text() or ""):
@@ -157,6 +162,29 @@ def get_next_page_url(page, current_url):
             if href:
                 return urljoin(current_url, href)
     return None
+
+
+# ----------------------------------------------------------------------
+# Helper: locate Chrome executable in bundled folder
+# ----------------------------------------------------------------------
+def get_bundled_chrome_path():
+    """
+    Returns path to chrome.exe inside the PyInstaller bundle,
+    or None if not frozen.
+    """
+    if not getattr(sys, "frozen", False):
+        return None
+    # The browsers folder contains subfolders like chromium-1217/chrome-win64/chrome.exe
+    browsers_dir = os.path.join(sys._MEIPASS, "browsers")
+    # Find the chromium directory
+    for entry in os.listdir(browsers_dir):
+        if entry.startswith("chromium-") and not entry.startswith("chromium_headless"):
+            chrome_path = os.path.join(
+                browsers_dir, entry, "chrome-win64", "chrome.exe"
+            )
+            if os.path.exists(chrome_path):
+                return chrome_path
+    raise FileNotFoundError("Could not find chrome.exe in bundled browsers")
 
 
 # ----------------------------------------------------------------------
@@ -264,7 +292,13 @@ def main():
     page_num = 0
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
+        # Determine if we need to use the bundled browser
+        executable_path = get_bundled_chrome_path()  # None if not frozen
+
+        browser = p.chromium.launch(
+            headless=headless,
+            executable_path=executable_path,
+        )
         context_options = {}
         if args.user_agent:
             context_options["user_agent"] = args.user_agent
@@ -277,24 +311,17 @@ def main():
             page_num += 1
             logger.info(f"Loading page {page_num}: {url}")
             try:
-                # Navigate to page – wait forever if needed
                 page.goto(url, wait_until="domcontentloaded", timeout=0)
-                # Small cooldown to let any redirects or bot challenges settle
-                time.sleep(3)
-                # Random jitter after the page is stable
+                time.sleep(3)  # allow for any redirects
                 time.sleep(random.uniform(args.delay_min, args.delay_max))
             except Exception as e:
                 logger.error(f"Failed to load page: {e}")
                 break
 
-            # Check for CAPTCHA
-            try:
-                content = page.content()
-                if "Enter the characters you see below" in content:
-                    logger.warning("CAPTCHA or robot check encountered. Stopping.")
-                    break
-            except Exception:
-                pass
+            content = page.content()
+            if "Enter the characters you see below" in content:
+                logger.warning("CAPTCHA or robot check encountered. Stopping.")
+                break
 
             reviews = extract_reviews_from_page(page, logger)
             if not reviews:
